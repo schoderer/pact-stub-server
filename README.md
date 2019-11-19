@@ -1,7 +1,5 @@
-# Standalone Pact Stub Server
+# FORK OF Standalone Pact Stub Server
 
-[![Build Status](https://travis-ci.org/uglyog/pact-stub-server.svg?branch=master)](https://travis-ci.org/uglyog/pact-stub-server)
-[![Windows Build status](https://ci.appveyor.com/api/projects/status/vigbo2qdyk9x7mo9?svg=true)](https://ci.appveyor.com/project/uglyog/pact-stub-server)
 
 This project provides a server that can generate responses based on pact files. It is a single executable binary. 
 It implements the [V3 Pact specification](https://github.com/pact-foundation/pact-specification/tree/version-3).
@@ -26,10 +24,11 @@ USAGE:
     pact-stub-server [FLAGS] [OPTIONS] --dir <dir>... --file <file>... --url <url>...
 
 FLAGS:
-    -o, --cors            Automatically respond to OPTIONS requests and return default CORS headers
-    -h, --help            Prints help information
-        --insecure-tls    Disables TLS certificate validation
-    -v, --version         Prints version information
+    -b, --log-missmatching-bodies    Logs missmatching request/response bodies 
+    -o, --cors                       Automatically respond to OPTIONS requests and return default CORS headers
+    -h, --help                       Prints help information
+        --insecure-tls               Disables TLS certificate validation
+    -v, --version                    Prints version information
 
 OPTIONS:
     -d, --dir <dir>...                                               Directory of pact files to verify (can be repeated)
