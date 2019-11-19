@@ -344,6 +344,12 @@ fn handle_command_args() -> Result<(), i32> {
             .empty_values(false)
             .validator(regex_value)
             .help("Provider state regular expression to filter the responses by"))
+        .arg(Arg::with_name("log-missmatching-bodies")
+            .short("b")
+            .long("missmatching-bodies")
+            .takes_value(false)
+            .use_delimiter(false)
+            .help("Logs missmatching bodies to stdout"))
         .arg(Arg::with_name("provider-state-header-name")
             .long("provider-state-header-name")
             .takes_value(true)
@@ -376,7 +382,7 @@ fn handle_command_args() -> Result<(), i32> {
                 let provider_state_header_name = matches.value_of("provider-state-header-name")
                     .map(|filter| String::from(filter));
                 server::start_server(port, pacts.iter().cloned().map(|p| p.unwrap()).collect(),
-                                     matches.is_present("cors"),
+                                     matches.is_present("cors"), matches.is_present("log-missmatching-bodies"),
                                      provider_state, provider_state_header_name, &mut tokio_runtime)
             }
         },

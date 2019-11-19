@@ -22,7 +22,8 @@ pub struct ServerHandler {
     sources: Arc<Vec<Pact>>,
     auto_cors: bool,
     provider_state: Option<Regex>,
-    provider_state_header_name: Option<String>
+    provider_state_header_name: Option<String>,
+    print_missmatching_bodies: bool,
 }
 
 fn method_supports_payload(request: &Request) -> bool {
@@ -32,7 +33,7 @@ fn method_supports_payload(request: &Request) -> bool {
     }
 }
 
-fn find_matching_request(request: &Request, auto_cors: bool, sources: &Vec<Pact>, provider_state: Option<Regex>) -> Result<Response, String> {
+fn find_matching_request(request: &Request, auto_cors: bool, sources: &Vec<Pact>, provider_state: Option<Regex>, print_missmatching_bodies: bool) -> Result<Response, String> {
     match provider_state.clone() {
         Some(state) => info!("Filtering interactions by provider state regex '{}'", state),
         None => ()
@@ -48,10 +49,28 @@ fn find_matching_request(request: &Request, auto_cors: bool, sources: &Vec<Pact>
         .map(|i| (i.clone(), pact_matching::match_request(i.request, request.clone())))
         .filter(|&(_, ref mismatches)| mismatches.iter().all(|mismatch|{
             match mismatch {
-                &Mismatch::MethodMismatch { .. } => false,
-                &Mismatch::PathMismatch { .. } => false,
-                &Mismatch::QueryMismatch { .. } => false,
-                &Mismatch::BodyMismatch { .. } => !(method_supports_payload(request) && request.body.is_present()),
+                Mismatch::MethodMismatch { .. } => false,
+                Mismatch::PathMismatch { .. } => false,
+                Mismatch::QueryMismatch { .. } => false,
+                Mismatch::BodyMismatch { actual, expected, mismatch,.. } => {
+                    if print_missmatching_bodies {
+                        let expected_json = expected.as_ref().and_then(|input| to_pretty_json(input));
+                        let actual_json = actual.as_ref().and_then(|input| to_pretty_json(input));
+                        let mut error_message = String::new();
+                        error_message.push_str(&format!(" <===> Bodymismatch: \nReason: {}", mismatch));
+                        if let Some(json) = expected_json {
+                            error_message.push_str("\nExpected body: \n");
+                            error_message.push_str(&json);
+                        }
+                        if let Some(json) = actual_json {
+                            error_message.push_str("\nActual body: \n");
+                            error_message.push_str(&json);
+                        }
+
+                        info!("{}", error_message);
+                    }
+                    return !(method_supports_payload(request) && request.body.is_present());
+                },
                 _ => true
             }
         }))
@@ -85,12 +104,16 @@ fn find_matching_request(request: &Request, auto_cors: bool, sources: &Vec<Pact>
     }
 }
 
-fn handle_request(request: Request, auto_cors: bool, sources: Arc<Vec<Pact>>, provider_state: Option<Regex>) -> Response {
+fn to_pretty_json(input: &[u8]) -> Option<String>{
+    serde_json::from_slice(input).ok().and_then(|parsed: serde_json::Value| serde_json::to_string_pretty(&parsed).ok())
+}
+
+fn handle_request(request: Request, auto_cors: bool, sources: Arc<Vec<Pact>>, provider_state: Option<Regex>, print_missmatching_bodies: bool) -> Response {
     info! ("===> Received {}", request);
     debug!("     body: '{}'", request.body.str_value());
     debug!("     matching_rules: {:?}", request.matching_rules);
     debug!("     generators: {:?}", request.generators);
-    match find_matching_request(&request, auto_cors, &sources, provider_state) {
+    match find_matching_request(&request, auto_cors, &sources, provider_state, print_missmatching_bodies) {
         Ok(response) => response,
         Err(msg) => {
             warn!("{}, sending {}", msg, StatusCode::NOT_FOUND);
@@ -108,12 +131,13 @@ fn handle_request(request: Request, auto_cors: bool, sources: Arc<Vec<Pact>>, pr
 
 impl ServerHandler {
     pub fn new(sources: Vec<Pact>, auto_cors: bool, provider_state: Option<Regex>,
-               provider_state_header_name: Option<String>) ->  ServerHandler {
+               provider_state_header_name: Option<String>,print_missmatching_bodies: bool) ->  ServerHandler {
         ServerHandler {
             sources: Arc::new(sources),
             auto_cors,
             provider_state,
-            provider_state_header_name
+            provider_state_header_name,
+            print_missmatching_bodies,
         }
     }
 }
@@ -128,6 +152,7 @@ impl Service for ServerHandler {
     fn call(&mut self, req: HyperRequest<Body>) -> <Self as Service>::Future {
         let auto_cors = self.auto_cors;
         let sources = self.sources.clone();
+        let print_missmatching_bodies = self.print_missmatching_bodies;
         let mut provider_state = self.provider_state.clone();
         let (parts, body) = req.into_parts();
         if self.provider_state_header_name.is_some() {
@@ -152,7 +177,7 @@ impl Service for ServerHandler {
                 }
             }))
             .map(move |body| pact_support::hyper_request_to_pact_request(parts, body))
-            .map(move |req| handle_request(req, auto_cors, sources, provider_state))
+            .map(move |req| handle_request(req, auto_cors, sources, provider_state, print_missmatching_bodies))
             .map(|res| pact_support::pact_response_to_hyper_response(&res))
             .into_future();
         ServerHandlerFuture { future: Box::new(future) }
@@ -160,7 +185,7 @@ impl Service for ServerHandler {
 }
 
 pub struct ServerHandlerFuture {
-    future: Box<Future<Item=HyperResponse<Body>, Error=HyperError> + Send>
+    future: Box<dyn Future<Item=HyperResponse<Body>, Error=HyperError> + Send>
 }
 
 impl Future for ServerHandlerFuture {
@@ -185,14 +210,14 @@ impl NewService for ServerHandler {
     }
 }
 
-pub fn start_server(port: u16, sources: Vec<Pact>, auto_cors: bool, provider_state:
+pub fn start_server(port: u16, sources: Vec<Pact>, auto_cors: bool, print_missmatching_bodies: bool, provider_state:
 Option<Regex>, provider_state_header_name: Option<String>, runtime: &mut Runtime) -> Result<(),
     i32> {
     let addr = ([0, 0, 0, 0], port).into();
     match Server::try_bind(&addr) {
         Ok(builder) => {
             let server = builder.http1_keepalive(false)
-                .serve(ServerHandler::new(sources, auto_cors, provider_state, provider_state_header_name));
+                .serve(ServerHandler::new(sources, auto_cors, provider_state, provider_state_header_name, print_missmatching_bodies));
             info!("Server started on port {}", server.local_addr().port());
             runtime.block_on(server.map_err(|err| error!("could not start server: {}", err)))
                 .map_err(|_| {
@@ -226,7 +251,7 @@ mod test {
 
         let request1 = Request::default_request();
 
-        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2], None)).to(be_ok().value(interaction1.response));
+        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2], None, false)).to(be_ok().value(interaction1.response));
     }
 
     #[test]
@@ -241,7 +266,7 @@ mod test {
 
         let request1 = Request { method: s!("POST"), .. Request::default_request() };
 
-        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2], None)).to(be_err());
+        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2], None, false)).to(be_err());
     }
 
     #[test]
@@ -255,7 +280,7 @@ mod test {
 
         let request1 = Request { path: s!("/two"), .. Request::default_request() };
 
-        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2], None)).to(be_err());
+        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2], None, false)).to(be_err());
     }
 
     #[test]
@@ -273,7 +298,7 @@ mod test {
             query: Some(hashmap!{ s!("A") => vec![ s!("C") ] }),
             .. Request::default_request() };
 
-        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2], None)).to(be_err());
+        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2], None, false)).to(be_err());
     }
 
     #[test]
@@ -309,10 +334,10 @@ mod test {
         let request4 = Request { method: s!("PUT"), headers: Some(hashmap!{ s!("Content-Type") => vec![s!("application/json")] }),
             .. Request::default_request() };
 
-        expect!(super::find_matching_request(&request1, false, &vec![pact1.clone(), pact2.clone()], None)).to(be_ok());
-        expect!(super::find_matching_request(&request2, false, &vec![pact1.clone(), pact2.clone()], None)).to(be_err());
-        expect!(super::find_matching_request(&request3, false, &vec![pact1.clone(), pact2.clone()], None)).to(be_ok());
-        expect!(super::find_matching_request(&request4, false, &vec![pact1.clone(), pact2.clone()], None)).to(be_ok());
+        expect!(super::find_matching_request(&request1, false, &vec![pact1.clone(), pact2.clone()], None, false)).to(be_ok());
+        expect!(super::find_matching_request(&request2, false, &vec![pact1.clone(), pact2.clone()], None, false)).to(be_err());
+        expect!(super::find_matching_request(&request3, false, &vec![pact1.clone(), pact2.clone()], None, false)).to(be_ok());
+        expect!(super::find_matching_request(&request4, false, &vec![pact1.clone(), pact2.clone()], None, false)).to(be_ok());
     }
 
     #[test]
@@ -336,7 +361,7 @@ mod test {
             body: OptionalBody::Present("{\"a\": 1, \"b\": 4, \"c\": 6}".as_bytes().into()),
             .. Request::default_request() };
 
-        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2], None)).to(be_ok().value(interaction2.response));
+        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2], None, false)).to(be_ok().value(interaction2.response));
     }
 
     #[test]
@@ -348,8 +373,8 @@ mod test {
             method: s!("OPTIONS"),
             .. Request::default_request() };
 
-        expect!(super::find_matching_request(&request1, true, &vec![pact1.clone()], None)).to(be_ok());
-        expect!(super::find_matching_request(&request1, false, &vec![pact1.clone()], None)).to(be_err());
+        expect!(super::find_matching_request(&request1, true, &vec![pact1.clone()], None, false)).to(be_ok());
+        expect!(super::find_matching_request(&request1, false, &vec![pact1.clone()], None, false)).to(be_err());
     }
 
     #[test]
@@ -386,7 +411,7 @@ mod test {
             query: Some(hashmap!{ s!("page") => vec![ s!("3") ] }),
             .. Request::default_request() };
 
-        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2.clone()], None)).to(be_ok());
+        expect!(super::find_matching_request(&request1, false, &vec![pact1, pact2.clone()], None, false)).to(be_ok());
     }
 
     #[test]
@@ -419,11 +444,11 @@ mod test {
 
         let request = Request::default_request();
 
-        expect!(super::find_matching_request(&request, false, &vec![pact.clone()], Some(Regex::new("state one").unwrap()))).to(be_ok().value(response1.clone()));
-        expect!(super::find_matching_request(&request, false, &vec![pact.clone()], Some(Regex::new("state two").unwrap()))).to(be_ok().value(response2.clone()));
-        expect!(super::find_matching_request(&request, false, &vec![pact.clone()], Some(Regex::new("state three").unwrap()))).to(be_ok().value(response3.clone()));
-        expect!(super::find_matching_request(&request, false, &vec![pact.clone()], Some(Regex::new("state four").unwrap()))).to(be_err());
-        expect!(super::find_matching_request(&request, false, &vec![pact.clone()], Some(Regex::new("state .*").unwrap()))).to(be_ok().value(response1.clone()));
+        expect!(super::find_matching_request(&request, false, &vec![pact.clone()], Some(Regex::new("state one").unwrap()), false)).to(be_ok().value(response1.clone()));
+        expect!(super::find_matching_request(&request, false, &vec![pact.clone()], Some(Regex::new("state two").unwrap()), false)).to(be_ok().value(response2.clone()));
+        expect!(super::find_matching_request(&request, false, &vec![pact.clone()], Some(Regex::new("state three").unwrap()), false)).to(be_ok().value(response3.clone()));
+        expect!(super::find_matching_request(&request, false, &vec![pact.clone()], Some(Regex::new("state four").unwrap()), false)).to(be_err());
+        expect!(super::find_matching_request(&request, false, &vec![pact.clone()], Some(Regex::new("state .*").unwrap()), false)).to(be_ok().value(response1.clone()));
     }
 
     #[test]
@@ -436,7 +461,7 @@ mod test {
 
         let request = Request { headers: Some(hashmap!{ s!("TEST-X") => vec![s!("X, Y")] }), .. Request::default_request() };
 
-        let result = super::find_matching_request(&request, false, &vec![pact], None);
+        let result = super::find_matching_request(&request, false, &vec![pact], None, false);
         expect!(result).to(be_ok().value(interaction.response));
     }
 }
