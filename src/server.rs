@@ -33,71 +33,102 @@ fn method_supports_payload(request: &Request) -> bool {
     }
 }
 
+fn explain_mismatches(request: &Request, mismatches: &Vec<(Interaction, Vec<Mismatch>)>) {
+    warn!("");
+    warn!("No pact request matched out of a total of {}", mismatches.len());
+    warn!("Received request: {} {}", request.method, request.path);
+    let interactions_with_path_match = mismatches.iter()
+        .filter(|(_, ref ms)|
+            !ms.iter().any(|x| match x {
+                Mismatch::PathMismatch { .. } => true,
+                _ => false
+            }))
+        .collect_vec();
+    match interactions_with_path_match.len() {
+        0 => warn!("Mismatch reason: No expected request with path {} found", request.path),
+        _ => {
+            warn!("Found {} expected request(s) with path {}:", interactions_with_path_match.len(), request.path);
+            interactions_with_path_match
+                .iter()
+                .enumerate()
+                .map(|(i, (interaction, m))| {
+                    let description = m.iter()
+                        .filter(|m| match m {
+                            Mismatch::BodyMismatch { .. } => {
+                                // only log body if both the expected request and the incoming request has a body
+                                method_supports_payload(request) && method_supports_payload(&interaction.request)
+                            }
+                            _ => true
+                        })
+                        .map(|m| match m {
+                            Mismatch::MethodMismatch { expected, actual } =>
+                                format!("HTTP Method does not match, expected: {}, actual: {}", expected, actual),
+                            Mismatch::QueryMismatch { mismatch, .. } =>
+                                format!("Query does not match: {}", mismatch),
+                            Mismatch::HeaderMismatch { mismatch, .. } =>
+                                format!("Header does not match: {}", mismatch),
+                            Mismatch::BodyTypeMismatch { expected, actual } =>
+                                format!("Body type does not match, expected: {}, actual: {}", expected, actual),
+                            Mismatch::BodyMismatch { path, mismatch, .. } =>
+                                format!("Body does not match at path '{}': {}", path, mismatch),
+                            _ => String::from("Unexpected Mismatch type"),
+                        }).join("\n");
+                    return format!("Mismatched request {} ({}):\n{}", i + 1, request, description);
+                })
+                .for_each(|m| warn!("{}", m));
+        }
+    }
+}
+
 fn find_matching_request(request: &Request, auto_cors: bool, sources: &Vec<Pact>, provider_state: Option<Regex>, print_missmatching_bodies: bool) -> Result<Response, String> {
     match provider_state.clone() {
         Some(state) => info!("Filtering interactions by provider state regex '{}'", state),
         None => ()
     }
-    let match_results = sources
+    let (matches, mismatches): (Vec<(Interaction, Vec<Mismatch>)>, Vec<(Interaction, Vec<Mismatch>)>) =
+        sources
+            .iter()
+            .flat_map(|pact| &pact.interactions)
+            .filter(|i| match provider_state {
+                Some(ref regex) => i.provider_states.iter()
+                    .any(|state| regex.is_match(state.name.as_str())),
+                None => true
+            })
+            .map(|i| (i.clone(), pact_matching::match_request(i.request.clone(), request.clone())))
+            .partition(|&(_, ref mismatches)| mismatches.iter().all(|mismatch| {
+                match mismatch {
+                    Mismatch::MethodMismatch { .. } => false,
+                    Mismatch::PathMismatch { .. } => false,
+                    Mismatch::QueryMismatch { .. } => false,
+                    Mismatch::BodyMismatch { .. } =>
+                        !(method_supports_payload(request) && request.body.is_present()),
+                    _ => true
+                }
+            }));
+    match matches
         .iter()
-        .flat_map(|pact| pact.interactions.clone())
-        .filter(|i| match provider_state {
-            Some(ref regex) => i.provider_states.iter().any(|state| regex.is_match(state.name
-                .as_str())),
-            None => true
-        })
-        .map(|i| (i.clone(), pact_matching::match_request(i.request, request.clone())))
-        .filter(|&(_, ref mismatches)| mismatches.iter().all(|mismatch|{
-            match mismatch {
-                Mismatch::MethodMismatch { .. } => false,
-                Mismatch::PathMismatch { .. } => false,
-                Mismatch::QueryMismatch { .. } => false,
-                Mismatch::BodyMismatch { actual, expected, mismatch,.. } => {
-                    if print_missmatching_bodies {
-                        let expected_json = expected.as_ref().and_then(|input| to_pretty_json(input));
-                        let actual_json = actual.as_ref().and_then(|input| to_pretty_json(input));
-                        let mut error_message = String::new();
-                        error_message.push_str(&format!(" <===> Bodymismatch: \nReason: {}", mismatch));
-                        if let Some(json) = expected_json {
-                            error_message.push_str("\nExpected body: \n");
-                            error_message.push_str(&json);
-                        }
-                        if let Some(json) = actual_json {
-                            error_message.push_str("\nActual body: \n");
-                            error_message.push_str(&json);
-                        }
-
-                        info!("{}", error_message);
-                    }
-                    return !(method_supports_payload(request) && request.body.is_present());
-                },
-                _ => true
-            }
-        }))
         .sorted_by(|a, b| Ord::cmp(&a.1.len(), &b.1.len()))
         .iter()
-        .map(|&(ref i, _)| i)
-        .cloned()
-        .collect::<Vec<Interaction>>();
-
-    if match_results.len() > 1 {
-        warn!("Found more than one pact request for method {} and path '{}', using the first one with the least number of mismatches",
-              request.method, request.path);
-    }
-
-    match match_results.first() {
-        Some(interaction) => Ok(pact_matching::generate_response(&interaction.response)),
+        .map(|&(i, _)| i.clone())
+        .collect::<Vec<Interaction>>()
+        .first() {
+        Some(interaction) => {
+            warn!("Found more than one pact request for {} {}, using the first one with the least number of mismatches",
+                  request.method, request.path);
+            Ok(pact_matching::generate_response(&interaction.response))
+        },
         None => {
             if auto_cors && request.method.to_uppercase() == "OPTIONS" {
                 Ok(Response {
-                    headers: Some(hashmap!{
+                    headers: Some(hashmap! {
                     s!("Access-Control-Allow-Headers") => vec![s!("*")],
                     s!("Access-Control-Allow-Methods") => vec![s!("GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH")],
                     s!("Access-Control-Allow-Origin") => vec![s!("*")]
                   }),
-                    .. Response::default_response()
+                    ..Response::default_response()
                 })
             } else {
+                explain_mismatches(request, &mismatches);
                 Err(s!("No matching request found"))
             }
         }
