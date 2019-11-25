@@ -81,9 +81,8 @@ fn explain_mismatches(request: &Request, mismatches: &Vec<(Interaction, Vec<Mism
 }
 
 fn find_matching_request(request: &Request, auto_cors: bool, sources: &Vec<Pact>, provider_state: Option<Regex>, print_missmatching_bodies: bool) -> Result<Response, String> {
-    match provider_state.clone() {
-        Some(state) => info!("Filtering interactions by provider state regex '{}'", state),
-        None => ()
+    if let Some(ref state) = provider_state {
+        info!("Filtering interactions by provider state regex '{}'", state)
     }
     let (matches, mismatches): (Vec<(Interaction, Vec<Mismatch>)>, Vec<(Interaction, Vec<Mismatch>)>) =
         sources
@@ -107,10 +106,10 @@ fn find_matching_request(request: &Request, auto_cors: bool, sources: &Vec<Pact>
             }));
     match matches
         .iter()
-        .sorted_by(|a, b| Ord::cmp(&a.1.len(), &b.1.len()))
+        .sorted_by(|(_, missmatches_a), (_, missmatches_b)| Ord::cmp(&missmatches_a.len(), &missmatches_b.len()))
         .iter()
-        .map(|&(i, _)| i.clone())
-        .collect::<Vec<Interaction>>()
+        .map(|(i, _)| i)
+        .collect::<Vec<&Interaction>>()
         .first() {
         Some(interaction) => {
             warn!("Found more than one pact request for {} {}, using the first one with the least number of mismatches",
@@ -133,10 +132,6 @@ fn find_matching_request(request: &Request, auto_cors: bool, sources: &Vec<Pact>
             }
         }
     }
-}
-
-fn to_pretty_json(input: &[u8]) -> Option<String>{
-    serde_json::from_slice(input).ok().and_then(|parsed: serde_json::Value| serde_json::to_string_pretty(&parsed).ok())
 }
 
 fn handle_request(request: Request, auto_cors: bool, sources: Arc<Vec<Pact>>, provider_state: Option<Regex>, print_missmatching_bodies: bool) -> Response {
