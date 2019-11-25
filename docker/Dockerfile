@@ -1,5 +1,5 @@
 FROM debian:stretch-slim
-ENV VERSION 0.3.3
+ENV VERSION 0.3.3.1
 WORKDIR /app
 RUN apt-get update && apt-get install -y curl openssl && \
     curl -L -o pact-stub-server.gz https://github.com/schoderer/pact-stub-server/releases/download/v$VERSION/pact-stub-server.gz && \
