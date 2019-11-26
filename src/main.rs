@@ -105,6 +105,8 @@ mod pact_support;
 mod server;
 
 fn main() {
+    std::env::set_var("RUST_LOG", "pact_matching=debug");
+
     match handle_command_args() {
         Ok(_) => (),
         Err(err) => std::process::exit(err)
